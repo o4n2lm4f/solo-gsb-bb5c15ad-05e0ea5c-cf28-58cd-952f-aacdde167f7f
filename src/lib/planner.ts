@@ -8,9 +8,14 @@ import {
   type ParsedCidr,
 } from './ip'
 import type {
+  Baseline,
+  BaselineEntry,
   FailureItem,
+  PlanOptions,
   PlanResult,
   PlannerInput,
+  RearrangeInfo,
+  RearrangeNote,
   RequirementInput,
   ReservedInput,
   Segment,
@@ -123,7 +128,248 @@ interface ParsedFixed {
   hosts: number
 }
 
-export function plan(input: PlannerInput): PlanResult {
+/** 一条待分配的自动需求（index 为录入顺序） */
+interface AutoEntry {
+  req: RequirementInput
+  hosts: number
+  index: number
+}
+
+/** 既有最低对齐策略：在占用区之外按地址升序，取第一个能容纳该前缀对齐块的间隙起点 */
+function lowestAlignedStart(
+  parentStart: number,
+  parentEnd: number,
+  occupied: Interval[],
+  prefix: number,
+): number | null {
+  const size = blockSize(prefix)
+  const gaps = computeGaps(parentStart, parentEnd, occupied)
+  for (const gap of gaps) {
+    if (gap.length < size) continue
+    // 间隙内第一个满足前缀边界对齐的地址（对齐结果若落在间隙之前则推进一个块）
+    let alignedStart = alignTo(gap.start, prefix)
+    if (alignedStart < gap.start) alignedStart += size
+    if (alignedStart + size - 1 <= gap.end) {
+      return alignedStart >>> 0 // 最低对齐空闲地址（间隙已按地址升序）
+    }
+  }
+  return null
+}
+
+/** 分配失败原因：最大连续空闲块不足，或空闲块足够但没有满足边界对齐的空间 */
+function gapFailureReason(
+  parentStart: number,
+  parentEnd: number,
+  occupied: Interval[],
+  prefix: number,
+): string {
+  const size = blockSize(prefix)
+  const gapsNow = computeGaps(parentStart, parentEnd, occupied)
+  const maxGap = gapsNow.reduce((m, g) => Math.max(m, g.length), 0)
+  if (maxGap < size) {
+    return `需要至少 ${size} 个连续地址（/${prefix}，可用 ${usableOf(size)} 台），当前最大连续空闲块仅 ${maxGap} 个地址`
+  }
+  return `空闲块虽有 ${maxGap} 个地址，但不存在满足 /${prefix} 边界对齐的 ${size} 地址空间`
+}
+
+/** 既有分配策略：自动需求从大到小（前缀小者优先），同规模按录入顺序，逐个取最低对齐空闲地址 */
+function allocateLowestAligned(
+  entries: AutoEntry[],
+  parentStart: number,
+  parentEnd: number,
+  occupied: Occupied[],
+  failures: FailureItem[],
+): void {
+  const ordered = [...entries].sort(
+    (a, b) => prefixForHosts(a.hosts) - prefixForHosts(b.hosts) || a.index - b.index,
+  )
+  for (const { req, hosts } of ordered) {
+    const prefix = prefixForHosts(hosts)
+    const size = blockSize(prefix)
+    const label = req.name || '未命名需求'
+
+    if (size < hosts + 2) {
+      failures.push({
+        id: req.id,
+        name: label,
+        hosts,
+        reason: `需要 ${hosts} 台主机，超过 IPv4 最大单网段可用容量 4294967294（/0）`,
+      })
+      continue
+    }
+
+    const start = lowestAlignedStart(parentStart, parentEnd, occupied, prefix)
+    if (start === null) {
+      failures.push({
+        id: req.id,
+        name: label,
+        hosts,
+        reason: gapFailureReason(parentStart, parentEnd, occupied, prefix),
+      })
+      continue
+    }
+
+    occupied.push({
+      kind: 'auto',
+      name: label,
+      prefix,
+      network: start,
+      start,
+      end: start + size - 1,
+      requestedHosts: hosts,
+      ownerId: req.id,
+    })
+  }
+}
+
+/** 基线自动需求的优先候选：按当前主机数计算目标前缀后，包含原网络地址的对齐块 */
+interface BaselineCandidate {
+  entry: AutoEntry
+  baseline: BaselineEntry
+  prefix: number
+  size: number
+  /** 候选块起始地址（包含原网络地址、按目标前缀对齐） */
+  start: number
+  end: number
+}
+
+/**
+ * 基线优先重排：为每个基线自动需求按当前主机数计算目标前缀，
+ * 把「包含原网络地址的对齐块」作为优先候选；候选越界、撞保留区/固定段或彼此冲突时，
+ * 按所需地址数从大到小、同规模按录入顺序保留可行候选，
+ * 落选候选与其余需求（新增、基线时未分配等）再按既有最低对齐策略分配。
+ */
+function allocateBaselineFirst(
+  entries: AutoEntry[],
+  baseline: Baseline,
+  parentStart: number,
+  parentEnd: number,
+  occupied: Occupied[],
+  failures: FailureItem[],
+): RearrangeInfo {
+  const baselineById = new Map(baseline.entries.map((e) => [e.id, e]))
+  const candidates: BaselineCandidate[] = []
+  const rest: AutoEntry[] = []
+  for (const entry of entries) {
+    const base = baselineById.get(entry.req.id)
+    if (
+      base &&
+      base.state === 'allocated' &&
+      base.kind === 'auto' &&
+      base.start !== undefined &&
+      base.prefix !== undefined
+    ) {
+      const prefix = prefixForHosts(entry.hosts)
+      const size = blockSize(prefix)
+      const start = alignTo(base.start, prefix)
+      candidates.push({ entry, baseline: base, prefix, size, start, end: start + size - 1 })
+    } else {
+      rest.push(entry)
+    }
+  }
+
+  // 保留可行候选：按所需地址数从大到小，同规模按录入顺序
+  const dropReason = new Map<string, string>()
+  const retainedIds = new Set<string>()
+  const ordered = [...candidates].sort((a, b) => b.size - a.size || a.entry.index - b.entry.index)
+  for (const cand of ordered) {
+    const { req, hosts } = cand.entry
+    const label = req.name || '未命名需求'
+    const cidr = formatCidr(cand.start, cand.prefix)
+    if (cand.size < hosts + 2) {
+      dropReason.set(req.id, `需要 ${hosts} 台主机，超过 IPv4 最大单网段可用容量 4294967294（/0）`)
+      continue
+    }
+    if (cand.start < parentStart || cand.end > parentEnd) {
+      dropReason.set(req.id, `候选块 ${cidr} 越出父网段`)
+      continue
+    }
+    const hit = occupied.find((oc) => overlap(oc, cand))
+    if (hit) {
+      const hitKind =
+        hit.kind === 'reserved' ? '保留区' : hit.kind === 'fixed' ? '固定网段' : '已保留的候选'
+      dropReason.set(req.id, `候选块 ${cidr} 与${hitKind}“${hit.name}”冲突`)
+      continue
+    }
+    retainedIds.add(req.id)
+    occupied.push({
+      kind: 'auto',
+      name: label,
+      prefix: cand.prefix,
+      network: cand.start,
+      start: cand.start,
+      end: cand.end,
+      requestedHosts: hosts,
+      ownerId: req.id,
+    })
+  }
+
+  // 其余需求（落选候选 + 无基线候选的需求）按既有最低对齐策略分配
+  const remaining = [
+    ...candidates.filter((c) => !retainedIds.has(c.entry.req.id)).map((c) => c.entry),
+    ...rest,
+  ]
+  allocateLowestAligned(remaining, parentStart, parentEnd, occupied, failures)
+
+  // 汇总每个基线自动需求的重排结果（按录入顺序输出）
+  const segByOwner = new Map<string, Occupied>()
+  for (const oc of occupied) if (oc.ownerId) segByOwner.set(oc.ownerId, oc)
+  const failureById = new Map(failures.map((f) => [f.id, f]))
+
+  const notes: RearrangeNote[] = candidates.map((cand) => {
+    const id = cand.entry.req.id
+    const name = cand.entry.req.name || '未命名需求'
+    const hosts = cand.entry.hosts
+    const baseStart = cand.baseline.start!
+    const basePrefix = cand.baseline.prefix!
+    const baselineCidr = formatCidr(baseStart, basePrefix)
+    const seg = segByOwner.get(id)
+    if (seg && seg.network === baseStart) {
+      // 网络地址未变 = 保留原址（前缀可能随主机数调整）
+      return {
+        id,
+        name,
+        hosts,
+        baselineCidr,
+        outcome: 'kept' as const,
+        cidr: formatCidr(seg.network, seg.prefix),
+        detail:
+          seg.prefix === basePrefix
+            ? `保留原址 ${formatCidr(seg.network, seg.prefix)}`
+            : `保留原址 ${intToIp(seg.network)}，容量随主机数调整（/${basePrefix} → /${seg.prefix}）`,
+      }
+    }
+    if (seg) {
+      const cidr = formatCidr(seg.network, seg.prefix)
+      const why = retainedIds.has(id)
+        ? `扩容后包含原网络地址 ${intToIp(baseStart)} 的对齐块变为 ${cidr}`
+        : `${dropReason.get(id) ?? '原址候选不可行'}，按最低对齐策略另选地址`
+      return {
+        id,
+        name,
+        hosts,
+        baselineCidr,
+        outcome: 'migrated' as const,
+        cidr,
+        detail: `${why}，迁至 ${cidr}`,
+      }
+    }
+    const f = failureById.get(id)
+    const parts = [dropReason.get(id), f?.reason].filter(Boolean)
+    return {
+      id,
+      name,
+      hosts,
+      baselineCidr,
+      outcome: 'unallocated' as const,
+      detail: `无法分配：${parts.join('；')}`,
+    }
+  })
+
+  return { notes }
+}
+
+export function plan(input: PlannerInput, options?: PlanOptions): PlanResult {
   const inputErrors: string[] = []
   const occupied: Occupied[] = []
 
@@ -261,71 +507,28 @@ export function plan(input: PlannerInput): PlanResult {
     })
   }
 
-  // 5) 自动需求：从大到小（前缀小者优先），同规模按录入顺序
-  const orderedAuto = autoItems
-    .map((entry, index) => ({ ...entry, index }))
-    .sort((a, b) => {
-      const pa = prefixForHosts(a.hosts)
-      const pb = prefixForHosts(b.hosts)
-      return pa - pb || a.index - b.index
-    })
-
+  // 5) 自动需求分配：基线优先重排仅在父网段与基线一致时生效，否则用既有最低对齐策略
   const failures: FailureItem[] = []
-  for (const { req, hosts } of orderedAuto) {
-    const prefix = prefixForHosts(hosts)
-    const size = blockSize(prefix)
-    const label = req.name || '未命名需求'
+  const indexedAuto: AutoEntry[] = autoItems.map((entry, index) => ({ ...entry, index }))
 
-    if (size < hosts + 2) {
-      failures.push({
-        id: req.id,
-        name: label,
-        hosts,
-        reason: `需要 ${hosts} 台主机，超过 IPv4 最大单网段可用容量 4294967294（/0）`,
-      })
-      continue
-    }
+  const baselineFirst =
+    options?.baselineFirst &&
+    options.baselineFirst.parentCidr === formatCidr(parent.network, parent.prefix)
+      ? options.baselineFirst
+      : null
 
-    const gaps = computeGaps(parentStart, parentEnd, occupied)
-    let placed: { start: number } | null = null
-    for (const gap of gaps) {
-      if (gap.length < size) continue
-      // 间隙内第一个满足前缀边界对齐的地址（对齐结果若落在间隙之前则推进一个块）
-      let alignedStart = alignTo(gap.start, prefix)
-      if (alignedStart < gap.start) alignedStart += size
-      if (alignedStart + size - 1 <= gap.end) {
-        placed = { start: alignedStart >>> 0 }
-        break // 最低对齐空闲地址（间隙已按地址升序）
-      }
-    }
-
-    if (!placed) {
-      const gapsNow = computeGaps(parentStart, parentEnd, occupied)
-      const maxGap = gapsNow.reduce((m, g) => Math.max(m, g.length), 0)
-      const reasons: string[] = []
-      if (maxGap < size) {
-        reasons.push(
-          `需要至少 ${size} 个连续地址（/${prefix}，可用 ${usableOf(size)} 台），当前最大连续空闲块仅 ${maxGap} 个地址`,
-        )
-      } else {
-        reasons.push(
-          `空闲块虽有 ${maxGap} 个地址，但不存在满足 /${prefix} 边界对齐的 ${size} 地址空间`,
-        )
-      }
-      failures.push({ id: req.id, name: label, hosts, reason: reasons.join('；') })
-      continue
-    }
-
-    occupied.push({
-      kind: 'auto',
-      name: label,
-      prefix,
-      network: placed.start,
-      start: placed.start,
-      end: placed.start + size - 1,
-      requestedHosts: hosts,
-      ownerId: req.id,
-    })
+  let rearrange: RearrangeInfo | undefined
+  if (baselineFirst) {
+    rearrange = allocateBaselineFirst(
+      indexedAuto,
+      baselineFirst,
+      parentStart,
+      parentEnd,
+      occupied,
+      failures,
+    )
+  } else {
+    allocateLowestAligned(indexedAuto, parentStart, parentEnd, occupied, failures)
   }
 
   // 6) 生成最终网段序列（占用 + 空闲，按地址排序）
@@ -370,6 +573,7 @@ export function plan(input: PlannerInput): PlanResult {
     segments,
     failures,
     inputErrors,
+    ...(rearrange ? { rearrange } : {}),
     summary: {
       reserved: reservedCap,
       fixed: fixedCap,

@@ -1161,5 +1161,317 @@ check(
   JSON.stringify(opt.rows[2]),
 )
 
+// ========== 19) 基线优先重排 ==========
+// 19a) 保留原址：基线时保留区 0/26 把 q1 挤到 128/25、q2 在 64/26；
+//  删除保留区后标准算法会把 q1 挪到 0/25、q2 挪到 128/26，重排模式保持原址
+const keepBaseInput: PlannerInput = {
+  parentCidr: '10.0.0.0/24',
+  reservations: [{ id: 'r1', name: '旧保留', cidr: '10.0.0.0/26' }],
+  requirements: [
+    { id: 'q1', name: '办公', hosts: 100, cidr: '' },
+    { id: 'q2', name: '机房', hosts: 40, cidr: '' },
+  ],
+}
+const keepBasePlan = plan(keepBaseInput)
+check(
+  '重排基线布局：q1=128/25、q2=64/26',
+  JSON.stringify(keepBasePlan.segments.filter((s) => s.kind === 'auto').map((s) => s.cidr)) ===
+    JSON.stringify(['10.0.0.64/26', '10.0.0.128/25']),
+  JSON.stringify(keepBasePlan.segments.map((s) => s.cidr)),
+)
+const keepBaseline = buildBaseline(keepBasePlan)
+const keepCurInput: PlannerInput = {
+  parentCidr: '10.0.0.0/24',
+  reservations: [],
+  requirements: [
+    { id: 'q1', name: '办公', hosts: 100, cidr: '' },
+    { id: 'q2', name: '机房', hosts: 40, cidr: '' },
+  ],
+}
+const keepStandard = plan(keepCurInput)
+check(
+  '标准算法会搬走 q1（0/25）与 q2（128/26）',
+  keepStandard.segments.find((s) => s.ownerId === 'q1')?.cidr === '10.0.0.0/25' &&
+    keepStandard.segments.find((s) => s.ownerId === 'q2')?.cidr === '10.0.0.128/26' &&
+    keepStandard.rearrange === undefined,
+  JSON.stringify(keepStandard.segments.filter((s) => s.kind === 'auto').map((s) => s.cidr)),
+)
+const keepRearr = plan(keepCurInput, { baselineFirst: keepBaseline })
+check(
+  '重排模式保留原址：q1=128/25、q2=64/26',
+  keepRearr.segments.find((s) => s.ownerId === 'q1')?.cidr === '10.0.0.128/25' &&
+    keepRearr.segments.find((s) => s.ownerId === 'q2')?.cidr === '10.0.0.64/26',
+  JSON.stringify(keepRearr.segments.filter((s) => s.kind === 'auto').map((s) => s.cidr)),
+)
+check(
+  '重排结果标明两条均为保留原址',
+  keepRearr.rearrange !== undefined &&
+    keepRearr.rearrange.notes.length === 2 &&
+    keepRearr.rearrange.notes.every((n) => n.outcome === 'kept'),
+  JSON.stringify(keepRearr.rearrange?.notes),
+)
+// 联动 1：基线对比随重排结果走 —— q1/q2 均为未变而非迁移
+const keepCmp = compareWithBaseline(keepBaseline, keepRearr)
+check(
+  '联动·基线对比：重排后 q1/q2 均为未变（标准算法下会显示迁移）',
+  keepCmp.rows.find((r) => r.id === 'q1')?.type === 'unchanged' &&
+    keepCmp.rows.find((r) => r.id === 'q2')?.type === 'unchanged' &&
+    compareWithBaseline(keepBaseline, keepStandard).rows.find((r) => r.id === 'q1')?.type ===
+      'migrated',
+)
+// 联动 2：主机登记随重排结果校验 —— 原网段内的登记在重排结果下保持有效
+const keepHost: HostAssignment[] = [
+  { id: 'h1', ownerId: 'q1', name: '办公网关', address: ipToInt('10.0.0.129'), mode: 'manual' },
+]
+check(
+  '联动·主机登记：重排保留原址使登记保持有效（标准算法下越界失效）',
+  reconcileHosts(keepHost, keepRearr).rows[0].valid === true &&
+    reconcileHosts(keepHost, keepStandard).rows[0].reason === 'out-of-subnet',
+)
+// 联动 3：路由汇总随重排结果走
+const keepSum = summarizeSegments(keepRearr.segments.filter((s) => s.kind === 'auto'))
+check(
+  '联动·路由汇总：按重排后网段汇总（64/26 + 128/25）',
+  blocksToCidrList(keepSum.blocks) === '10.0.0.64/26\n10.0.0.128/25' &&
+    keepSum.totalAddresses === 192,
+  blocksToCidrList(keepSum.blocks),
+)
+
+// 19b) 候选撞保留区 -> 迁移并注明原因；撞固定段同理
+const hitBase = buildBaseline(
+  plan({
+    parentCidr: '10.0.0.0/24',
+    reservations: [],
+    requirements: [
+      { id: 'q1', name: '办公', hosts: 40, cidr: '' },
+      { id: 'q2', name: '机房', hosts: 40, cidr: '' },
+      { id: 'q3', name: '管理', hosts: 2, cidr: '' },
+    ],
+  }),
+)
+const hitRearr = plan(
+  {
+    parentCidr: '10.0.0.0/24',
+    reservations: [{ id: 'r9', name: '新保留', cidr: '10.0.0.0/26' }],
+    requirements: [
+      { id: 'q1', name: '办公', hosts: 40, cidr: '' },
+      { id: 'q2', name: '机房', hosts: 40, cidr: '' },
+      { id: 'q3', name: '管理', hosts: 2, cidr: '' },
+    ],
+  },
+  { baselineFirst: hitBase },
+)
+const hitQ1 = hitRearr.rearrange?.notes.find((n) => n.id === 'q1')
+check(
+  '候选撞保留区：q1 迁至 192/26 并注明与保留区冲突，q2/q3 保留原址',
+  hitRearr.segments.find((s) => s.ownerId === 'q1')?.cidr === '10.0.0.192/26' &&
+    hitQ1?.outcome === 'migrated' &&
+    /保留区/.test(hitQ1.detail) &&
+    /新保留/.test(hitQ1.detail) &&
+    hitRearr.rearrange?.notes.find((n) => n.id === 'q2')?.outcome === 'kept' &&
+    hitRearr.rearrange?.notes.find((n) => n.id === 'q3')?.outcome === 'kept',
+  JSON.stringify(hitRearr.rearrange?.notes),
+)
+const hitFixed = plan(
+  {
+    parentCidr: '10.0.0.0/24',
+    reservations: [],
+    requirements: [
+      { id: 'qf', name: '固定位', hosts: 2, cidr: '10.0.0.0/26' },
+      { id: 'q1', name: '办公', hosts: 40, cidr: '' },
+    ],
+  },
+  { baselineFirst: hitBase },
+)
+const hitFixedQ1 = hitFixed.rearrange?.notes.find((n) => n.id === 'q1')
+check(
+  '候选撞固定段：q1 迁至 64/26 并注明与固定网段冲突',
+  hitFixed.segments.find((s) => s.ownerId === 'q1')?.cidr === '10.0.0.64/26' &&
+    hitFixedQ1?.outcome === 'migrated' &&
+    /固定网段/.test(hitFixedQ1.detail),
+  JSON.stringify(hitFixed.rearrange?.notes),
+)
+
+// 19c) 候选彼此冲突：按所需地址数从大到小保留（/29 候选挤走 /30 候选）
+const clashBase = buildBaseline(
+  plan({
+    parentCidr: '10.0.0.0/24',
+    reservations: [],
+    requirements: [
+      { id: 'q1', name: '甲', hosts: 2, cidr: '' },
+      { id: 'q2', name: '乙', hosts: 2, cidr: '' },
+    ],
+  }),
+)
+check(
+  '冲突场景基线：q1=0/30、q2=4/30',
+  clashBase.entries.find((e) => e.id === 'q1')?.cidr === '10.0.0.0/30' &&
+    clashBase.entries.find((e) => e.id === 'q2')?.cidr === '10.0.0.4/30',
+)
+const clashRearr = plan(
+  {
+    parentCidr: '10.0.0.0/24',
+    reservations: [],
+    requirements: [
+      { id: 'q1', name: '甲', hosts: 6, cidr: '' }, // 扩容到 /29，候选 0/29 覆盖 q2 原址
+      { id: 'q2', name: '乙', hosts: 2, cidr: '' },
+    ],
+  },
+  { baselineFirst: clashBase },
+)
+const clashQ1 = clashRearr.rearrange?.notes.find((n) => n.id === 'q1')
+const clashQ2 = clashRearr.rearrange?.notes.find((n) => n.id === 'q2')
+check(
+  '候选冲突大段优先：q1 保留原址扩为 0/29，q2 迁至 8/30 并注明与已保留候选冲突',
+  clashRearr.segments.find((s) => s.ownerId === 'q1')?.cidr === '10.0.0.0/29' &&
+    clashRearr.segments.find((s) => s.ownerId === 'q2')?.cidr === '10.0.0.8/30' &&
+    clashQ1?.outcome === 'kept' &&
+    /\/30 → \/29/.test(clashQ1.detail) &&
+    clashQ2?.outcome === 'migrated' &&
+    /已保留的候选/.test(clashQ2.detail) &&
+    /甲/.test(clashQ2.detail),
+  JSON.stringify(clashRearr.rearrange?.notes),
+)
+
+// 19d) 扩容使对齐块下移：候选仍被保留，但网络地址改变 -> 标明迁移
+const shiftBase = buildBaseline(
+  plan({
+    parentCidr: '10.0.0.0/24',
+    reservations: [{ id: 'r1', name: '旧保留', cidr: '10.0.0.0/26' }],
+    requirements: [
+      { id: 'q1', name: '办公', hosts: 40, cidr: '' },
+      { id: 'q2', name: '管理', hosts: 2, cidr: '' },
+    ],
+  }),
+)
+const shiftRearr = plan(
+  {
+    parentCidr: '10.0.0.0/24',
+    reservations: [],
+    requirements: [
+      { id: 'q1', name: '办公', hosts: 100, cidr: '' }, // /26 -> /25，候选块 0/25 包含原网络地址 64
+      { id: 'q2', name: '管理', hosts: 2, cidr: '' },
+    ],
+  },
+  { baselineFirst: shiftBase },
+)
+const shiftQ1 = shiftRearr.rearrange?.notes.find((n) => n.id === 'q1')
+check(
+  '扩容对齐块下移：q1 迁至 0/25（候选仍被采用），q2 保留原址',
+  shiftRearr.segments.find((s) => s.ownerId === 'q1')?.cidr === '10.0.0.0/25' &&
+    shiftQ1?.outcome === 'migrated' &&
+    /扩容后包含原网络地址 10\.0\.0\.64/.test(shiftQ1.detail) &&
+    shiftRearr.rearrange?.notes.find((n) => n.id === 'q2')?.outcome === 'kept',
+  JSON.stringify(shiftRearr.rearrange?.notes),
+)
+
+// 19e) 候选越界且无可分配空间 -> 无法分配并给出双重原因
+const obBase = buildBaseline(
+  plan({
+    parentCidr: '10.0.1.0/24',
+    reservations: [],
+    requirements: [
+      { id: 'q1', name: '大', hosts: 100, cidr: '' },
+      { id: 'q2', name: '小', hosts: 40, cidr: '' },
+    ],
+  }),
+)
+const obRearr = plan(
+  {
+    parentCidr: '10.0.1.0/24',
+    reservations: [],
+    requirements: [
+      { id: 'q1', name: '大', hosts: 300, cidr: '' }, // /23 候选 10.0.0.0/23 越出父网段
+      { id: 'q2', name: '小', hosts: 40, cidr: '' },
+    ],
+  },
+  { baselineFirst: obBase },
+)
+const obQ1 = obRearr.rearrange?.notes.find((n) => n.id === 'q1')
+check(
+  '候选越界：q1 无法分配并注明越界与空闲块不足，q2 保留原址',
+  obRearr.failures.some((f) => f.id === 'q1') &&
+    obQ1?.outcome === 'unallocated' &&
+    /越出父网段/.test(obQ1.detail) &&
+    /最大连续空闲块/.test(obQ1.detail) &&
+    obRearr.rearrange?.notes.find((n) => n.id === 'q2')?.outcome === 'kept',
+  JSON.stringify(obRearr.rearrange?.notes),
+)
+
+// 19f) 回退与禁用：无基线 / 父网段不一致 / 输入非法时与原算法严格一致
+check(
+  '关闭模式恢复原算法（baselineFirst 为 null 与不传参结果一致）',
+  JSON.stringify(plan(demo, { baselineFirst: null })) === JSON.stringify(plan(demo)) &&
+    JSON.stringify(plan(demo, {})) === JSON.stringify(plan(demo)),
+)
+const otherParent = plan(
+  { parentCidr: '192.168.99.0/24', reservations: [], requirements: keepCurInput.requirements },
+  { baselineFirst: keepBaseline }, // 基线父网段为 10.0.0.0/24，不一致 -> 忽略
+)
+check(
+  '父网段与基线不一致时禁用重排（无 rearrange 且结果同原算法）',
+  otherParent.rearrange === undefined &&
+    JSON.stringify(otherParent.segments) ===
+      JSON.stringify(
+        plan({ parentCidr: '192.168.99.0/24', reservations: [], requirements: keepCurInput.requirements })
+          .segments,
+      ),
+)
+check(
+  '输入非法时不生效（无 rearrange 字段）',
+  plan({ parentCidr: 'bad', reservations: [], requirements: [] }, { baselineFirst: keepBaseline })
+    .rearrange === undefined,
+)
+
+// 19g) 新增需求与基线外需求走最低对齐策略，且不出现在重排说明中
+const withNew = plan(
+  {
+    parentCidr: '10.0.0.0/24',
+    reservations: [],
+    requirements: [
+      { id: 'q1', name: '办公', hosts: 100, cidr: '' },
+      { id: 'q2', name: '机房', hosts: 40, cidr: '' },
+      { id: 'q3', name: '新增', hosts: 2, cidr: '' },
+    ],
+  },
+  { baselineFirst: keepBaseline },
+)
+check(
+  '新增需求按最低对齐分配（0/30），重排说明只含基线自动需求',
+  withNew.segments.find((s) => s.ownerId === 'q3')?.cidr === '10.0.0.0/30' &&
+    withNew.rearrange?.notes.length === 2 &&
+    !withNew.rearrange.notes.some((n) => n.id === 'q3'),
+  JSON.stringify(withNew.rearrange?.notes),
+)
+
+// 19h) 缩容但网络地址不变：保留原址并注明前缀调整
+const shrinkInPlace = plan(
+  {
+    parentCidr: '10.0.0.0/24',
+    reservations: [{ id: 'r1', name: '旧保留', cidr: '10.0.0.0/26' }],
+    requirements: [
+      { id: 'q1', name: '办公', hosts: 60, cidr: '' }, // /25 -> /26，候选 128/26 网络地址不变
+      { id: 'q2', name: '机房', hosts: 40, cidr: '' },
+    ],
+  },
+  { baselineFirst: keepBaseline },
+)
+const shrinkQ1 = shrinkInPlace.rearrange?.notes.find((n) => n.id === 'q1')
+check(
+  '缩容原位调整：q1 保留原址 128，前缀 /25 -> /26',
+  shrinkInPlace.segments.find((s) => s.ownerId === 'q1')?.cidr === '10.0.0.128/26' &&
+    shrinkQ1?.outcome === 'kept' &&
+    /\/25 → \/26/.test(shrinkQ1.detail),
+  JSON.stringify(shrinkInPlace.rearrange?.notes),
+)
+
+// 19i) 输入与基线完全一致时：重排结果 = 原算法结果，且对比无差异
+const sameAsBase = plan(keepBaseInput, { baselineFirst: keepBaseline })
+check(
+  '输入未变时重排与原算法布局一致、对比全部未变',
+  JSON.stringify(sameAsBase.segments) === JSON.stringify(keepBasePlan.segments) &&
+    compareWithBaseline(keepBaseline, sameAsBase).hasChanges === false,
+)
+
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)
 process.exit(failures === 0 ? 0 : 1)

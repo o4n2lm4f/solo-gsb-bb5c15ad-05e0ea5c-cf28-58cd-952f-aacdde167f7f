@@ -48,6 +48,8 @@ export default function App() {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
   // 基线只存在于当前浏览器会话（sessionStorage），挂载时恢复
   const [baseline, setBaseline] = useState<Baseline | null>(() => loadBaseline())
+  // 基线优先重排开关：仅在父网段与基线一致且输入合法时实际生效（规划引擎内部兜底）
+  const [rearrangeOn, setRearrangeOn] = useState(false)
   // 主机地址登记仅在当前会话内存中保留；与规划引擎、基线、汇总、导出完全解耦
   const [hostAssignments, setHostAssignments] = useState<HostAssignment[]>([])
   // DHCP Option 121：客户端网段（需求稳定 ID）+ 路由录入（行内稳定 ID，规划变化后保留并重新校验）
@@ -55,8 +57,12 @@ export default function App() {
   const [option121Routes, setOption121Routes] = useState<Option121RouteInput[]>([])
 
   const result = useMemo(
-    () => plan({ parentCidr, reservations, requirements }),
-    [parentCidr, reservations, requirements],
+    () =>
+      plan(
+        { parentCidr, reservations, requirements },
+        { baselineFirst: rearrangeOn ? baseline : null },
+      ),
+    [parentCidr, reservations, requirements, rearrangeOn, baseline],
   )
 
   // 输入非法时保留基线但暂停对比
@@ -315,6 +321,8 @@ export default function App() {
         comparison={comparison}
         onSave={handleSaveBaseline}
         onClear={handleClearBaseline}
+        rearrangeOn={rearrangeOn}
+        onRearrangeChange={setRearrangeOn}
       />
 
       <RouteSummaryPanel result={result} />

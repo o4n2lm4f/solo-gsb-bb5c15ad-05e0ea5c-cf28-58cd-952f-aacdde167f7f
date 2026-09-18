@@ -58,6 +58,8 @@ export interface PlanResult {
   failures: FailureItem[]
   /** 输入级错误（父网段、保留区、固定网段非法等），非空时 segments 不可信 */
   inputErrors: string[]
+  /** 基线优先重排生效时的逐需求结果说明；未生效（模式关闭/无基线/父网段不一致）时缺省 */
+  rearrange?: RearrangeInfo
   summary: {
     reserved: number
     fixed: number
@@ -76,6 +78,40 @@ export interface PlannerInput {
   parentCidr: string
   reservations: ReservedInput[]
   requirements: RequirementInput[]
+}
+
+/** 规划可选参数（全部缺省时与原算法严格一致） */
+export interface PlanOptions {
+  /**
+   * 基线优先重排：提供基线时，若父网段与基线一致且输入合法，
+   * 各基线自动需求优先保留「包含原网络地址的对齐块」，其余需求仍按最低对齐策略分配；
+   * 父网段不一致或输入非法时自动回退原算法。
+   */
+  baselineFirst?: Baseline | null
+}
+
+/* ---------- 基线优先重排 ---------- */
+
+/** 基线自动需求在重排中的结果：保留原址 / 迁移 / 无法分配 */
+export type RearrangeOutcome = 'kept' | 'migrated' | 'unallocated'
+
+export interface RearrangeNote {
+  /** 需求稳定 ID */
+  id: string
+  name: string
+  hosts: number
+  /** 基线时的网段 CIDR */
+  baselineCidr: string
+  outcome: RearrangeOutcome
+  /** 本次分配到的网段 CIDR（无法分配时缺省） */
+  cidr?: string
+  /** 面向用户的说明（保留原址 / 迁移原因 / 无法分配原因） */
+  detail: string
+}
+
+/** 基线优先重排的结果说明（按需求录入顺序），仅在该模式实际生效时挂在 PlanResult 上 */
+export interface RearrangeInfo {
+  notes: RearrangeNote[]
 }
 
 /** 基线快照中的单个需求（按稳定 ID 参与对比） */

@@ -1,6 +1,13 @@
 import { intToIp } from '../lib/ip'
 import { formatRange } from '../lib/baseline'
-import type { Baseline, BaselineComparison, ChangeRow, ChangeType, PlanResult } from '../lib/types'
+import type {
+  Baseline,
+  BaselineComparison,
+  ChangeRow,
+  ChangeType,
+  PlanResult,
+  RearrangeOutcome,
+} from '../lib/types'
 
 interface Props {
   baseline: Baseline | null
@@ -8,6 +15,9 @@ interface Props {
   comparison: BaselineComparison | null
   onSave: () => void
   onClear: () => void
+  /** 基线优先重排开关状态（父网段不一致 / 无基线 / 输入非法时由面板禁用） */
+  rearrangeOn: boolean
+  onRearrangeChange: (on: boolean) => void
 }
 
 const TYPE_META: Record<ChangeType, { label: string; cls: string }> = {
@@ -31,6 +41,43 @@ const FILTER_TYPES: ChangeType[] = [
   'still-unallocated',
   'unchanged',
 ]
+
+const REARRANGE_META: Record<RearrangeOutcome, { label: string; cls: string }> = {
+  kept: { label: '保留原址', cls: 'kept' },
+  migrated: { label: '迁移', cls: 'migrated' },
+  unallocated: { label: '无法分配', cls: 'unalloc' },
+}
+
+/** 基线优先重排的逐需求结果（保留原址 / 迁移 / 无法分配及原因） */
+function RearrangeNotes({ result }: { result: PlanResult }) {
+  const info = result.rearrange
+  if (!info || info.notes.length === 0) return null
+  const count = (o: RearrangeOutcome) => info.notes.filter((n) => n.outcome === o).length
+  return (
+    <div className="rearrange-box">
+      <div className="rearrange-summary">
+        基线优先重排结果：保留原址 <strong>{count('kept')}</strong> · 迁移{' '}
+        <strong>{count('migrated')}</strong> · 无法分配 <strong>{count('unallocated')}</strong>
+      </div>
+      <ul className="rearrange-notes">
+        {info.notes.map((n) => {
+          const m = REARRANGE_META[n.outcome]
+          return (
+            <li key={n.id}>
+              <span className={`change-badge ${m.cls}`}>{m.label}</span>
+              <span className="rearrange-name">{n.name}</span>
+              <span className="mono rearrange-cidr">
+                {n.baselineCidr}
+                {n.cidr && n.cidr !== n.baselineCidr ? ` → ${n.cidr}` : ''}
+              </span>
+              <span className="rearrange-detail">{n.detail}</span>
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
+}
 
 function fmtTime(iso: string): string {
   const d = new Date(iso)
@@ -194,9 +241,47 @@ function ChangeTable({ rows }: { rows: ChangeRow[] }) {
   )
 }
 
-export default function BaselinePanel({ baseline, result, comparison, onSave, onClear }: Props) {
+export default function BaselinePanel({
+  baseline,
+  result,
+  comparison,
+  onSave,
+  onClear,
+  rearrangeOn,
+  onRearrangeChange,
+}: Props) {
   const canSave = result.inputErrors.length === 0 && result.segments.length > 0
   const paused = baseline !== null && result.inputErrors.length > 0
+
+  // 基线优先重排可用性：需有基线、输入合法、父网段与基线一致
+  const inputInvalid = result.inputErrors.length > 0
+  const parentMismatch =
+    baseline !== null && !inputInvalid && baseline.parentCidr !== result.parentCidr
+  const rearrangeAvailable = baseline !== null && !inputInvalid && !parentMismatch
+  const rearrangeHint = !baseline
+    ? '保存基线后，且父网段与基线一致时可用'
+    : inputInvalid
+      ? '当前输入存在错误，修正后可用'
+      : parentMismatch
+        ? `父网段与基线（${baseline.parentCidr}）不一致，模式已暂停`
+        : rearrangeOn
+          ? '已生效：基线自动需求优先保留原址，其余按最低对齐策略分配'
+          : '开启后各基线自动需求优先保留「包含原网络地址的对齐块」，冲突时大段优先'
+
+  const rearrangeToggle = (
+    <div className="rearrange-row">
+      <label className={`rearrange-toggle${rearrangeAvailable ? '' : ' is-disabled'}`}>
+        <input
+          type="checkbox"
+          checked={rearrangeOn && rearrangeAvailable}
+          disabled={!rearrangeAvailable}
+          onChange={(e) => onRearrangeChange(e.target.checked)}
+        />
+        基线优先重排
+      </label>
+      <span className="rearrange-hint">{rearrangeHint}</span>
+    </div>
+  )
 
   if (!baseline) {
     return (
@@ -207,6 +292,7 @@ export default function BaselinePanel({ baseline, result, comparison, onSave, on
           即可按需求的稳定 ID 对比新旧结果：新增、删除、未变、扩容/缩容、迁移（CIDR 改变）、
           未分配与恢复分配，并汇总地址区间的新占用、释放与净变化。基线仅保存在当前浏览器会话中。
         </p>
+        {rearrangeToggle}
         <div className="btn-row">
           <button className="primary" onClick={onSave} disabled={!canSave}>
             保存当前规划为基线
@@ -237,6 +323,10 @@ export default function BaselinePanel({ baseline, result, comparison, onSave, on
           </button>
         </div>
       </div>
+
+      {rearrangeToggle}
+
+      <RearrangeNotes result={result} />
 
       {paused && (
         <div className="fail-box baseline-paused">

@@ -597,6 +597,92 @@ tr.row-unchanged {
   box-shadow: inset 3px 0 0 rgba(148, 163, 184, 0.35);
 }
 
+/* ---------- 基线优先重排 ---------- */
+.rearrange-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.rearrange-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.rearrange-toggle input {
+  accent-color: var(--accent);
+  width: auto;
+}
+
+.rearrange-toggle.is-disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.rearrange-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rearrange-box {
+  background: var(--panel-2);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+
+.rearrange-summary {
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.rearrange-notes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+}
+
+.rearrange-notes li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 3px 0;
+  border-bottom: 1px dashed rgba(148, 163, 184, 0.15);
+}
+
+.rearrange-notes li:last-child {
+  border-bottom: none;
+}
+
+.rearrange-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.rearrange-cidr {
+  color: var(--accent);
+}
+
+.rearrange-detail {
+  color: var(--muted);
+  flex-basis: 100%;
+}
+
+.change-badge.kept {
+  background: rgba(52, 211, 153, 0.16);
+  color: #6ee7b7;
+  border-color: rgba(52, 211, 153, 0.4);
+}
+
 /* ---------- 路由汇总 ---------- */
 .summary-panel {
   border-color: rgba(52, 211, 153, 0.35);
