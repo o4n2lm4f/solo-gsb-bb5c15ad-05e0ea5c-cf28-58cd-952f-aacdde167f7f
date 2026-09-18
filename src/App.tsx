@@ -3,6 +3,7 @@ import AddressBar from './components/AddressBar'
 import BaselinePanel from './components/BaselinePanel'
 import HostAddressPanel from './components/HostAddressPanel'
 import Option121Panel from './components/Option121Panel'
+import { ReflowSummaryBar } from './components/ReflowReport'
 import RouteSummaryPanel from './components/RouteSummaryPanel'
 import SegmentDetail from './components/SegmentDetail'
 import SegmentTable from './components/SegmentTable'
@@ -15,6 +16,7 @@ import {
   saveBaseline,
 } from './lib/baseline'
 import { downloadJson } from './lib/exporter'
+import { formatCidr, parseCidr } from './lib/ip'
 import { plan } from './lib/planner'
 import type {
   Baseline,
@@ -48,15 +50,28 @@ export default function App() {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
   // 基线只存在于当前浏览器会话（sessionStorage），挂载时恢复
   const [baseline, setBaseline] = useState<Baseline | null>(() => loadBaseline())
+  // 「基线优先重排」模式开关：仅在存在基线且父网段与基线一致时可用
+  const [reflowEnabled, setReflowEnabled] = useState(false)
   // 主机地址登记仅在当前会话内存中保留；与规划引擎、基线、汇总、导出完全解耦
   const [hostAssignments, setHostAssignments] = useState<HostAssignment[]>([])
   // DHCP Option 121：客户端网段（需求稳定 ID）+ 路由录入（行内稳定 ID，规划变化后保留并重新校验）
   const [option121ClientId, setOption121ClientId] = useState('')
   const [option121Routes, setOption121Routes] = useState<Option121RouteInput[]>([])
 
+  // 重排生效条件：有基线、父网段为规范 CIDR 且与基线完全一致（输入非法/父网段变化时禁用）
+  const parentForReflow = useMemo(() => {
+    const raw = parentCidr.trim()
+    if (!raw) return null
+    const parsed = parseCidr(raw, true)
+    return parsed && !('error' in parsed) ? formatCidr(parsed.network, parsed.prefix) : null
+  }, [parentCidr])
+  const reflowAvailable =
+    baseline !== null && parentForReflow !== null && parentForReflow === baseline.parentCidr
+  const reflowActive = reflowEnabled && reflowAvailable
+
   const result = useMemo(
-    () => plan({ parentCidr, reservations, requirements }),
-    [parentCidr, reservations, requirements],
+    () => plan({ parentCidr, reservations, requirements, baseline: reflowActive ? baseline : null }),
+    [parentCidr, reservations, requirements, baseline, reflowActive],
   )
 
   // 输入非法时保留基线但暂停对比
@@ -78,6 +93,7 @@ export default function App() {
   function handleClearBaseline() {
     setBaseline(null)
     clearStoredBaseline()
+    setReflowEnabled(false)
   }
 
   // 网段明细表使用的 需求ID -> 变化 映射
@@ -279,6 +295,10 @@ export default function App() {
             </div>
           )}
 
+          {reflowActive && result.reflow && (
+            <ReflowSummaryBar report={result.reflow} />
+          )}
+
           {result.segments.length > 0 && (
             <>
               <div className="panel">
@@ -315,6 +335,9 @@ export default function App() {
         comparison={comparison}
         onSave={handleSaveBaseline}
         onClear={handleClearBaseline}
+        reflowEnabled={reflowEnabled}
+        onReflowChange={setReflowEnabled}
+        reflowAvailable={reflowAvailable}
       />
 
       <RouteSummaryPanel result={result} />
@@ -349,6 +372,7 @@ export default function App() {
             selectedIndex={safeSelected}
             onSelect={setSelectedIndex}
             changesById={changesById}
+            showReflow={reflowActive}
           />
         </div>
       )}

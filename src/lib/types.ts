@@ -40,6 +40,10 @@ export interface Segment {
   reason?: string
   /** 关联的需求 ID（fixed/auto）或保留区 ID（reserved），用于基线对比 */
   ownerId?: string
+  /** 基线优先重排模式：最终落点相对基线原址的结果（仅重排生效时，自动网段有值） */
+  baselineOutcome?: 'kept' | 'moved'
+  /** 是否通过「包含原网络地址的对齐块」优先候选落位（false/缺省表示走最低对齐策略） */
+  baselineAnchored?: boolean
 }
 
 export interface FailureItem {
@@ -58,6 +62,8 @@ export interface PlanResult {
   failures: FailureItem[]
   /** 输入级错误（父网段、保留区、固定网段非法等），非空时 segments 不可信 */
   inputErrors: string[]
+  /** 基线优先重排模式的过程与结果报告（仅该模式生效时存在） */
+  reflow?: ReflowReport
   summary: {
     reserved: number
     fixed: number
@@ -76,6 +82,66 @@ export interface PlannerInput {
   parentCidr: string
   reservations: ReservedInput[]
   requirements: RequirementInput[]
+  /** 启用「基线优先重排」时传入的基线（父网段与当前一致才会实际生效） */
+  baseline?: Baseline | null
+}
+
+/* ---------- 基线优先重排 ---------- */
+
+/** 重排明细行中单个需求的处置状态 */
+export type ReflowStatus =
+  | 'kept' // 优先候选可行，保留在原址（当前 CIDR 起点 = 基线起点）
+  | 'moved' // 优先候选可行，但对齐块起点已不同于基线起点（原址容纳不下新前缀等）
+  | 'fallback-kept' // 优先候选不可行，最低对齐策略恰好落在基线原址
+  | 'fallback-moved' // 优先候选不可行，由最低对齐策略迁移
+  | 'failed' // 优先候选与最低对齐策略均失败，无法分配
+  | 'fixed-untouched' // 基线固定需求、当前仍是固定网段：不参与重排
+  | 'became-fixed' // 基线自动需求（或基线未分配）、当前变成固定网段：由固定段决定，不参与重排
+  | 'baseline-fixed' // 基线固定需求、当前变成自动需求：不进行原址优先
+  | 'baseline-failed' // 基线时本就未分配：无原址可保留
+  | 'new' // 基线保存后新增的需求：无原址，直接走最低对齐策略
+
+export interface ReflowCandidate {
+  /** 优先候选（包含基线网络地址的对齐块）CIDR */
+  cidr: string
+  /** 候选是否被采纳 */
+  accepted: boolean
+  /** 未采纳原因（越界 / 撞保留区 / 撞固定段 / 与已采纳候选冲突） */
+  reason?: string
+}
+
+export interface ReflowRow {
+  id: string
+  name: string
+  hosts: number
+  status: ReflowStatus
+  /** 基线时的网段 CIDR（无基线的新增需求为 undefined） */
+  baselineCidr?: string
+  /** 当前最终网段 CIDR（失败时为 undefined） */
+  currentCidr?: string
+  /** 当前失败原因（status=failed 时） */
+  reason?: string
+  /** 该需求的优先候选及采纳情况（仅基线自动需求存在） */
+  candidate?: ReflowCandidate
+}
+
+export interface ReflowReport {
+  /** 重排实际生效（基线存在、父网段一致、输入合法） */
+  active: boolean
+  rows: ReflowRow[]
+  counts: {
+    kept: number
+    moved: number
+    fallbackKept: number
+    fallbackMoved: number
+    failed: number
+    skipped: number
+    new: number
+  }
+  /** 优先候选被采纳（保留原址/在原址块内迁移）的需求数 */
+  anchorsAccepted: number
+  /** 优先候选被拒绝（随后走最低对齐策略或失败）的需求数 */
+  anchorsRejected: number
 }
 
 /** 基线快照中的单个需求（按稳定 ID 参与对比） */

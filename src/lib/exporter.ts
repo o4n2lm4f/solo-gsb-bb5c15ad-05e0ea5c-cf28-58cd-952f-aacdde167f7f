@@ -19,15 +19,42 @@ function segmentForExport(s: Segment) {
     可用主机数: s.usable,
   }
   if (s.kind === 'free') return base
-  return {
+  const withNeed = {
     ...base,
     需求主机数: s.requestedHosts ?? null,
     浪费量: s.waste,
   }
+  if (s.kind === 'auto' && s.baselineOutcome) {
+    return {
+      ...withNeed,
+      基线重排:
+        s.baselineOutcome === 'kept'
+          ? s.baselineAnchored
+            ? '保留原址（优先候选）'
+            : '保留原址（最低对齐）'
+          : s.baselineAnchored
+            ? '迁移（优先候选对齐块）'
+            : '迁移（最低对齐）',
+    }
+  }
+  return withNeed
+}
+
+const REFLOW_STATUS_TEXT: Record<string, string> = {
+  kept: '保留原址',
+  moved: '原址块内迁移',
+  'fallback-kept': '兜底保留原址',
+  'fallback-moved': '兜底迁移',
+  failed: '无法分配',
+  'fixed-untouched': '固定段不参与重排',
+  'became-fixed': '转为固定段',
+  'baseline-fixed': '基线固定段转自动',
+  'baseline-failed': '基线时未分配',
+  new: '新增需求',
 }
 
 export function buildExportJson(result: PlanResult, input: { parentCidr: string }): string {
-  const payload = {
+  const payload: Record<string, unknown> = {
     导出时间: new Date().toISOString(),
     父CIDR: result.parentCidr || input.parentCidr,
     父网络地址: result.parentNetwork,
@@ -49,6 +76,31 @@ export function buildExportJson(result: PlanResult, input: { parentCidr: string 
       需求主机数: f.hosts,
       原因: f.reason,
     })),
+  }
+  if (result.reflow) {
+    const c = result.reflow.counts
+    payload['基线优先重排'] = {
+      保留原址: c.kept,
+      原址块内迁移: c.moved,
+      兜底保留: c.fallbackKept,
+      兜底迁移: c.fallbackMoved,
+      无法分配: c.failed,
+      新增需求: c.new,
+      不参与重排: c.skipped,
+      优先候选采纳数: result.reflow.anchorsAccepted,
+      优先候选被拒数: result.reflow.anchorsRejected,
+      明细: result.reflow.rows.map((row) => ({
+        名称: row.name,
+        结果: REFLOW_STATUS_TEXT[row.status] ?? row.status,
+        需求主机数: row.hosts,
+        基线网段: row.baselineCidr ?? null,
+        优先候选: row.candidate
+          ? { 网段: row.candidate.cidr, 是否采纳: row.candidate.accepted, 未采纳原因: row.candidate.reason ?? null }
+          : null,
+        当前网段: row.currentCidr ?? null,
+        原因: row.reason ?? null,
+      })),
+    }
   }
   return JSON.stringify(payload, null, 2)
 }

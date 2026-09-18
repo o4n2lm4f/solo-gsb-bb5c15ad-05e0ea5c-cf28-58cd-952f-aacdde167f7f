@@ -1,5 +1,6 @@
 import { intToIp } from '../lib/ip'
 import { formatRange } from '../lib/baseline'
+import ReflowReportPanel from './ReflowReport'
 import type { Baseline, BaselineComparison, ChangeRow, ChangeType, PlanResult } from '../lib/types'
 
 interface Props {
@@ -8,6 +9,11 @@ interface Props {
   comparison: BaselineComparison | null
   onSave: () => void
   onClear: () => void
+  /** 基线优先重排模式开关状态 */
+  reflowEnabled: boolean
+  onReflowChange: (enabled: boolean) => void
+  /** 模式当前是否可用（存在基线且父网段与基线一致、输入合法） */
+  reflowAvailable: boolean
 }
 
 const TYPE_META: Record<ChangeType, { label: string; cls: string }> = {
@@ -194,9 +200,56 @@ function ChangeTable({ rows }: { rows: ChangeRow[] }) {
   )
 }
 
-export default function BaselinePanel({ baseline, result, comparison, onSave, onClear }: Props) {
+function ReflowToggle({
+  enabled,
+  available,
+  onToggle,
+  hint,
+}: {
+  enabled: boolean
+  available: boolean
+  onToggle: (v: boolean) => void
+  hint: string
+}) {
+  return (
+    <div className={`reflow-toggle${available ? '' : ' disabled'}${enabled ? ' on' : ''}`}>
+      <label className="switch">
+        <input
+          type="checkbox"
+          role="switch"
+          checked={enabled && available}
+          disabled={!available}
+          onChange={(e) => onToggle(e.target.checked)}
+        />
+        <span>基线优先重排</span>
+      </label>
+      <span className="reflow-toggle-hint">
+        {enabled && available
+          ? '已启用：为每个基线自动需求优先保留包含原网络地址的对齐块，关闭后恢复原算法'
+          : hint || '父网段与基线一致时可启用'}
+      </span>
+    </div>
+  )
+}
+
+export default function BaselinePanel({
+  baseline,
+  result,
+  comparison,
+  onSave,
+  onClear,
+  reflowEnabled,
+  onReflowChange,
+  reflowAvailable,
+}: Props) {
   const canSave = result.inputErrors.length === 0 && result.segments.length > 0
   const paused = baseline !== null && result.inputErrors.length > 0
+
+  const reflowHint = !baseline
+    ? '保存基线后可启用'
+    : !reflowAvailable
+      ? `仅在父网段与基线（${baseline.parentCidr}）完全一致时可用`
+      : ''
 
   if (!baseline) {
     return (
@@ -215,6 +268,12 @@ export default function BaselinePanel({ baseline, result, comparison, onSave, on
             <span className="hint-warn">请先消除左侧输入错误</span>
           )}
         </div>
+        <ReflowToggle
+          enabled={false}
+          available={false}
+          onToggle={onReflowChange}
+          hint={reflowHint}
+        />
       </div>
     )
   }
@@ -237,6 +296,13 @@ export default function BaselinePanel({ baseline, result, comparison, onSave, on
           </button>
         </div>
       </div>
+
+      <ReflowToggle
+        enabled={reflowEnabled}
+        available={reflowAvailable}
+        onToggle={onReflowChange}
+        hint={reflowHint}
+      />
 
       {paused && (
         <div className="fail-box baseline-paused">
@@ -322,6 +388,12 @@ export default function BaselinePanel({ baseline, result, comparison, onSave, on
           <h3 className="table-heading">需求级变化明细（按稳定 ID 对比，共 {comparison.rows.length} 项）</h3>
           <ChangeTable rows={comparison.rows} />
         </>
+      )}
+
+      {!paused && result.reflow && (
+        <div style={{ marginTop: 18 }}>
+          <ReflowReportPanel result={result} />
+        </div>
       )}
     </div>
   )

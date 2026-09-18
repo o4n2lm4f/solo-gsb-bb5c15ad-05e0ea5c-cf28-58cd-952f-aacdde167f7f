@@ -43,6 +43,12 @@ export default function SegmentDetail({ segment }: { segment: Segment }) {
         ) : (
           <Row k="浪费量">未分配</Row>
         )}
+        {segment.kind === 'auto' && segment.baselineOutcome && (
+          <Row k="基线重排">
+            {segment.baselineOutcome === 'kept' ? '保留原址' : '迁移'}
+            {segment.baselineAnchored ? '（优先候选）' : '（最低对齐策略）'}
+          </Row>
+        )}
       </div>
     </div>
   )

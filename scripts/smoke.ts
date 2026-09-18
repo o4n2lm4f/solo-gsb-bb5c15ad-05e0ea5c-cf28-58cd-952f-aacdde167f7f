@@ -1161,5 +1161,365 @@ check(
   JSON.stringify(opt.rows[2]),
 )
 
+// ========== 19) 基线优先重排 ==========
+// 19a) 关闭/无基线时结果与原算法完全一致（无 reflow 字段）
+const reflowOff = plan(demo)
+check('无基线不产生重排报告', reflowOff.reflow === undefined)
+const reflowBase = buildBaseline(reflowOff)
+check(
+  '传入基线但不启用（baseline 缺省）结果字节级一致',
+  JSON.stringify(plan(demo)) === JSON.stringify(reflowOff),
+)
+
+// 19b) 相同输入启用重排：全部基线自动需求经优先候选保留原址，布局与原算法相同
+const sameReflow = plan({ ...demo, baseline: reflowBase })
+check('重排报告生效', sameReflow.reflow?.active === true)
+check(
+  '相同输入重排布局不变',
+  JSON.stringify(sameReflow.segments.map((s) => s.cidr)) ===
+    JSON.stringify(reflowOff.segments.map((s) => s.cidr)),
+)
+check(
+  '三个基线自动需求全部保留原址（优先候选）',
+  sameReflow.reflow!.rows
+    .filter((r) => ['q1', 'q2', 'q4'].includes(r.id))
+    .every((r) => r.status === 'kept' && r.candidate?.accepted === true),
+  JSON.stringify(sameReflow.reflow!.rows),
+)
+check(
+  '固定段标记 fixed-untouched，新增/失败计数为 0',
+  sameReflow.reflow!.rows.find((r) => r.id === 'q3')?.status === 'fixed-untouched' &&
+    sameReflow.reflow!.counts.failed === 0 &&
+    sameReflow.reflow!.counts.new === 0 &&
+    sameReflow.reflow!.anchorsAccepted === 3 &&
+    sameReflow.reflow!.anchorsRejected === 0,
+)
+check(
+  '自动网段带 baselineOutcome=kept 与 anchored 标记',
+  sameReflow.segments
+    .filter((s) => s.kind === 'auto')
+    .every((s) => s.baselineOutcome === 'kept' && s.baselineAnchored === true),
+)
+
+// 19c) 重排的价值：删除固定段后又新增主机需求时，普通算法挤占原段，重排保持原址
+//  q4 需求从 2 台增至 25 台（/30 -> /27）：普通算法按规模序把 q4 落到 32/27，
+//  q1 缩出的空间与 q2 顺序不变，但新增的小需求会重排；这里用新增 /27 需求制造普通算法下的迁移
+const removeFixedNormal = plan({
+  ...demo,
+  requirements: [
+    ...demo.requirements.filter((q) => q.id !== 'q3'),
+    { id: 'q9', name: '新增段', hosts: 25, cidr: '' },
+  ],
+})
+check(
+  '普通算法：新增 /27 需求按规模序插入 32/27，q4 仍在 16/30（原固定段位置被新需求占据）',
+  removeFixedNormal.segments.find((s) => s.ownerId === 'q9')?.cidr === '192.168.10.32/27' &&
+    removeFixedNormal.segments.find((s) => s.ownerId === 'q4')?.cidr === '192.168.10.16/30',
+  JSON.stringify(removeFixedNormal.segments.map((s) => [s.ownerId, s.cidr])),
+)
+const removeFixedReflow = plan({
+  ...demo,
+  requirements: [
+    ...demo.requirements.filter((q) => q.id !== 'q3'),
+    { id: 'q9', name: '新增段', hosts: 25, cidr: '' },
+  ],
+  baseline: reflowBase,
+})
+check(
+  '重排模式下 q1/q2/q4 全部保留原址，新增需求避让到空闲间隙',
+  removeFixedReflow.segments.find((s) => s.ownerId === 'q1')?.cidr === '192.168.10.128/25' &&
+    removeFixedReflow.segments.find((s) => s.ownerId === 'q2')?.cidr === '192.168.10.64/26' &&
+    removeFixedReflow.segments.find((s) => s.ownerId === 'q4')?.cidr === '192.168.10.16/30',
+  JSON.stringify(removeFixedReflow.segments.map((s) => [s.ownerId, s.cidr])),
+)
+check(
+  '保留原址的段均为优先候选落位，新增段 q9 走最低对齐',
+  removeFixedReflow.segments
+    .filter((s) => s.kind === 'auto' && s.ownerId !== 'q9')
+    .every((s) => s.baselineOutcome === 'kept' && s.baselineAnchored === true) &&
+    removeFixedReflow.segments.find((s) => s.ownerId === 'q9')?.baselineAnchored === false,
+)
+
+// 19d) 扩容：q1 100 -> 200（/25 -> /24），包含原网络地址 128 的 /24 对齐块为 0/24，
+// 起点改变且覆盖固定段 32/27、保留 0/28 与 q4、q2 -> 候选被拒，兜底无空间 -> 失败并说明候选原因
+const growInput: PlannerInput = {
+  ...demo,
+  requirements: demo.requirements.map((q) => (q.id === 'q1' ? { ...q, hosts: 200 } : q)),
+}
+const growReflow = plan({ ...growInput, baseline: reflowBase })
+const q1grow = growReflow.reflow!.rows.find((r) => r.id === 'q1')!
+check(
+  'q1 扩容候选 0/24 撞保留区被拒，最终无法分配',
+  q1grow.status === 'failed' &&
+    q1grow.candidate?.cidr === '192.168.10.0/24' &&
+    q1grow.candidate.accepted === false &&
+    /冲突|撞/.test(q1grow.candidate.reason ?? '') &&
+    /基线优先候选.*不可行/.test(q1grow.reason ?? ''),
+  JSON.stringify(q1grow),
+)
+check('失败需求出现在 failures 且原因含候选说明', growReflow.failures.some((f) => f.id === 'q1' && /优先候选.*不可行/.test(f.reason)))
+
+// 19e) 缩容原址保留：q1 100 -> 60（/25 -> /26），对齐块 128/26 与所有占用不冲突 -> kept
+const shrinkInputReflow: PlannerInput = {
+  ...demo,
+  requirements: demo.requirements.map((q) => (q.id === 'q1' ? { ...q, hosts: 60 } : q)),
+}
+const shrinkReflow = plan({ ...shrinkInputReflow, baseline: reflowBase })
+check(
+  'q1 缩容在原址块 128/26 保留',
+  shrinkReflow.segments.find((s) => s.ownerId === 'q1')?.cidr === '192.168.10.128/26' &&
+    shrinkReflow.reflow!.rows.find((r) => r.id === 'q1')?.status === 'kept',
+)
+check('q2/q4 不受影响仍保留原址', shrinkReflow.segments.find((s) => s.ownerId === 'q2')?.cidr === '192.168.10.64/26')
+
+// 19f) 同规模候选冲突按录入顺序：基线 a@0/28、b@16/28；均扩到 /27，候选同为 0/27
+const tieBaseInput: PlannerInput = {
+  parentCidr: '10.0.0.0/24',
+  reservations: [],
+  requirements: [
+    { id: 'a', name: 'A', hosts: 10, cidr: '' },
+    { id: 'b', name: 'B', hosts: 10, cidr: '' },
+  ],
+}
+const tieBase = buildBaseline(plan(tieBaseInput))
+check(
+  '冲突基线布局 a=0/28、b=16/28',
+  plan(tieBaseInput).segments.filter((s) => s.kind === 'auto').map((s) => s.cidr).join(',') ===
+    '10.0.0.0/28,10.0.0.16/28',
+)
+const tieReflow = plan({
+  ...tieBaseInput,
+  requirements: [
+    { id: 'a', name: 'A', hosts: 20, cidr: '' },
+    { id: 'b', name: 'B', hosts: 20, cidr: '' },
+  ],
+  baseline: tieBase,
+})
+check(
+  '同规模冲突录入在前者 a 保留 0/27，b 候选被拒后兜底到 32/27',
+  tieReflow.segments.find((s) => s.ownerId === 'a')?.cidr === '10.0.0.0/27' &&
+    tieReflow.segments.find((s) => s.ownerId === 'b')?.cidr === '10.0.0.32/27',
+  JSON.stringify(tieReflow.segments.map((s) => [s.ownerId, s.cidr])),
+)
+const ta = tieReflow.reflow!.rows.find((r) => r.id === 'a')!
+const tb = tieReflow.reflow!.rows.find((r) => r.id === 'b')!
+check('a=kept 候选采纳；b=fallback-moved 候选被拒（与已保留候选冲突）',
+  ta.status === 'kept' && ta.candidate?.accepted === true &&
+    tb.status === 'fallback-moved' && tb.candidate?.accepted === false &&
+    /候选块|已保留原址/.test(tb.candidate?.reason ?? ''),
+  JSON.stringify([ta, tb]),
+)
+
+// 19g) 不同规模冲突大优先：a 录入在前（/27），b 在后（/26），候选都含 0 起点 -> b 胜
+const sizeReflow = plan({
+  ...tieBaseInput,
+  requirements: [
+    { id: 'a', name: 'A', hosts: 20, cidr: '' },
+    { id: 'b', name: 'B', hosts: 40, cidr: '' },
+  ],
+  baseline: tieBase,
+})
+check(
+  '大规模候选 b 保留 0/26，a 被挤到 64/27（不被录入顺序挡住）',
+  sizeReflow.segments.find((s) => s.ownerId === 'b')?.cidr === '10.0.0.0/26' &&
+    sizeReflow.segments.find((s) => s.ownerId === 'a')?.cidr === '10.0.0.64/27',
+  JSON.stringify(sizeReflow.segments.map((s) => [s.ownerId, s.cidr])),
+)
+check(
+  'b 为 moved（锚点 0/26 起点不同于基线 16），a 为 fallback-moved',
+  sizeReflow.reflow!.rows.find((r) => r.id === 'b')?.status === 'moved' &&
+    sizeReflow.reflow!.rows.find((r) => r.id === 'a')?.status === 'fallback-moved',
+  JSON.stringify(sizeReflow.reflow!.rows.map((r) => [r.id, r.status])),
+)
+
+// 19h) 候选越界：基线 a@192/27（父 /24），扩到 1000 台（/22，对齐块 0/22 共 1024 地址，越出 /24）
+const oobBase = buildBaseline(
+  plan({
+    parentCidr: '10.0.0.0/24',
+    reservations: [
+      { id: 'r1', name: 'R1', cidr: '10.0.0.0/25' },
+      { id: 'r2', name: 'R2', cidr: '10.0.0.128/26' },
+      { id: 'r3', name: 'R3', cidr: '10.0.0.192/28' },
+    ],
+    requirements: [{ id: 'a', name: 'A', hosts: 5, cidr: '' }], // a@224/29
+  }),
+)
+check(
+  '越界基线 a 落在 208/29',
+  plan({
+    parentCidr: '10.0.0.0/24',
+    reservations: [
+      { id: 'r1', name: 'R1', cidr: '10.0.0.0/25' },
+      { id: 'r2', name: 'R2', cidr: '10.0.0.128/26' },
+      { id: 'r3', name: 'R3', cidr: '10.0.0.192/28' },
+    ],
+    requirements: [{ id: 'a', name: 'A', hosts: 5, cidr: '' }],
+  }).segments.find((s) => s.ownerId === 'a')?.cidr === '10.0.0.208/29',
+)
+const oobReflow = plan({
+  parentCidr: '10.0.0.0/24',
+  reservations: [
+    { id: 'r1', name: 'R1', cidr: '10.0.0.0/25' },
+    { id: 'r2', name: 'R2', cidr: '10.0.0.128/26' },
+    { id: 'r3', name: 'R3', cidr: '10.0.0.192/28' },
+  ],
+  requirements: [{ id: 'a', name: 'A', hosts: 1000, cidr: '' }],
+  baseline: oobBase,
+})
+const oobRow = oobReflow.reflow!.rows.find((r) => r.id === 'a')!
+check(
+  '越界候选标记越出父网段，需求最终失败',
+  oobRow.status === 'failed' &&
+    oobRow.candidate?.accepted === false &&
+    /越出父网段/.test(oobRow.candidate.reason ?? ''),
+  JSON.stringify(oobRow),
+)
+
+// 19i) 候选撞保留区/固定段被拒，最低对齐仍可分配
+const fixedBase = buildBaseline(
+  plan({
+    parentCidr: '10.0.0.0/24',
+    reservations: [{ id: 'r', name: 'R', cidr: '10.0.0.0/26' }],
+    requirements: [{ id: 'a', name: 'A', hosts: 40, cidr: '' }], // a@64/26
+  }),
+)
+const hitFixed = plan({
+  parentCidr: '10.0.0.0/24',
+  reservations: [{ id: 'r', name: 'R', cidr: '10.0.0.0/26' }],
+  requirements: [
+    { id: 'f', name: '固定', hosts: 2, cidr: '10.0.0.64/27' },
+    { id: 'a', name: 'A', hosts: 100, cidr: '' }, // 锚 0/25 撞保留与固定
+  ],
+  baseline: fixedBase,
+})
+check(
+  '候选撞保留/固定被拒后由最低对齐落到 128/25',
+  hitFixed.segments.find((s) => s.ownerId === 'a')?.cidr === '10.0.0.128/25' &&
+    hitFixed.reflow!.rows.find((r) => r.id === 'a')?.status === 'fallback-moved' &&
+    hitFixed.segments.find((s) => s.ownerId === 'a')?.baselineAnchored === false,
+  JSON.stringify(hitFixed.reflow!.rows),
+)
+
+// 19j) 新增需求走最低对齐，标记 new；基线失败需求恢复后标记 baseline-failed
+const withNew = plan({
+  ...demo,
+  requirements: [...demo.requirements, { id: 'q9', name: '新增小需求', hosts: 2, cidr: '' }],
+  baseline: reflowBase,
+})
+check(
+  '新增需求标记 new，走最低对齐落在最低空闲 20/30',
+  withNew.reflow!.rows.find((r) => r.id === 'q9')?.status === 'new' &&
+    withNew.segments.find((s) => s.ownerId === 'q9')?.cidr === '192.168.10.20/30',
+  JSON.stringify(withNew.reflow!.rows.map((r) => [r.id, r.status])),
+)
+// 同一父网段 /24 内：q1 需要 1000 台（/22 越界）基线时失败；改为 100 台后恢复
+const failedBase = buildBaseline(
+  plan({
+    parentCidr: '192.168.10.0/24',
+    reservations: [],
+    requirements: [{ id: 'q1', name: '放不下', hosts: 1000, cidr: '' }],
+  }),
+)
+check('基线失败场景确实未分配', plan({
+  parentCidr: '192.168.10.0/24',
+  reservations: [],
+  requirements: [{ id: 'q1', name: '放不下', hosts: 1000, cidr: '' }],
+}).failures.length === 1)
+const recoveredReflow = plan({
+  parentCidr: '192.168.10.0/24',
+  reservations: [],
+  requirements: [{ id: 'q1', name: '放不下', hosts: 100, cidr: '' }],
+  baseline: failedBase,
+})
+check(
+  '基线时未分配的需求恢复后标记 baseline-failed（无优先候选）',
+  recoveredReflow.reflow!.rows.find((r) => r.id === 'q1')?.status === 'baseline-failed' &&
+    recoveredReflow.reflow!.rows.find((r) => r.id === 'q1')?.candidate === undefined,
+)
+
+// 19k) 父网段变化时重排不生效（即使传入基线）
+const changedParent = plan({ ...demo, parentCidr: '192.168.11.0/24', baseline: reflowBase })
+check('父网段变化时 reflow 不生效', changedParent.reflow === undefined)
+
+// 19l) 地址守恒与占用互不重叠（所有重排场景）
+for (const [label, p] of [
+  ['same', sameReflow],
+  ['removeFixed', removeFixedReflow],
+  ['shrink', shrinkReflow],
+  ['tie', tieReflow],
+  ['size', sizeReflow],
+  ['hitFixed', hitFixed],
+  ['withNew', withNew],
+] as const) {
+  const occ = p.segments.filter((s) => s.kind !== 'free').sort((a, b) => a.start - b.start)
+  let noOverlap = true
+  for (let i = 1; i < occ.length; i++) if (occ[i].start <= occ[i - 1].end) noOverlap = false
+  const conserved =
+    p.summary.reserved + p.summary.fixed + p.summary.auto + p.summary.free === p.parentSize
+  check(`重排(${label})占用段互不重叠且地址守恒`, noOverlap && conserved, label)
+}
+
+// 19m) 联动：基线对比读取重排结果（删固定段+新增需求，重排使 q1/q2/q4 原址不动）
+const linked = compareWithBaseline(reflowBase, removeFixedReflow)
+check(
+  '重排保留原址后 q1/q2/q4 全部未变，q3 删除、q9 新增',
+  linked.counts.unchanged === 3 &&
+    linked.rows.find((r) => r.id === 'q3')?.type === 'removed' &&
+    linked.rows.find((r) => r.id === 'q9')?.type === 'added',
+  JSON.stringify(linked.counts),
+)
+// q9 重排后落在 192/27（32 地址），恰好补回 q3 固定段释放的 32 地址
+check('重排后净地址变化为 0（新增段与删除固定段地址数相等）', linked.summary.net === 0, String(linked.summary.net))
+
+// 19n) 联动：主机登记按重排后的网段重新校验，原址保留则地址继续有效
+const hostLinked = reconcileHosts(
+  [
+    { id: 'h1', ownerId: 'q1', name: '办公网关', address: ipToInt('192.168.10.129'), mode: 'auto' },
+    { id: 'h2', ownerId: 'q2', name: '机房设备', address: ipToInt('192.168.10.65'), mode: 'auto' },
+  ],
+  removeFixedReflow,
+)
+check(
+  '重排保留原址：原主机登记全部仍有效，不产生失效',
+  hostLinked.rows.every((r) => r.valid),
+  JSON.stringify(hostLinked.rows.map((r) => [r.assignment.id, r.reason])),
+)
+// 对照组：同样输入普通算法下 q1 仍在 128/25（不会失效）；改用 19d 的缩容场景验证迁移失效：
+// q1 100->60 普通算法把 q1 放到 64/26、q2 挤到 128/26，原 129 失效；重排后 q1 留在 128/26 仍有效
+const hostShrinkNormal = reconcileHosts(
+  [{ id: 'h1', ownerId: 'q1', name: '办公网关', address: ipToInt('192.168.10.129'), mode: 'auto' }],
+  plan(shrinkInputReflow),
+)
+const hostShrinkReflow = reconcileHosts(
+  [{ id: 'h1', ownerId: 'q1', name: '办公网关', address: ipToInt('192.168.10.129'), mode: 'auto' }],
+  shrinkReflow,
+)
+check(
+  '对照组：普通算法缩容重排后 129 越出 q1 新网段 64/26 而失效；重排保留 128/26 仍有效',
+  !hostShrinkNormal.rows[0].valid && hostShrinkReflow.rows[0].valid,
+  JSON.stringify([hostShrinkNormal.rows[0].reason, hostShrinkReflow.rows[0].reason]),
+)
+
+// 19o) 联动：路由汇总读取重排后网段（所选并集仍精确守恒：128+64+4+32=228）
+const sumLinked = summarizeSegments(
+  removeFixedReflow.segments.filter((s) => s.kind === 'auto'),
+)
+check(
+  '重排后路由汇总地址数 = 128+64+4+32 = 228',
+  sumLinked.totalAddresses === 228 && sumLinked.blocks.reduce((n, b) => n + b.capacity, 0) === 228,
+  String(sumLinked.totalAddresses),
+)
+
+// 19p) 导出 JSON 含重排统计与逐需求明细
+const reflowExport = buildExportJson(removeFixedReflow, { parentCidr: demo.parentCidr })
+check('导出包含基线优先重排段', /基线优先重排/.test(reflowExport))
+check('导出明细含保留原址结果', /保留原址/.test(reflowExport))
+const offExport = buildExportJson(reflowOff, { parentCidr: demo.parentCidr })
+check('关闭模式导出不含重排段', !/基线优先重排/.test(offExport))
+
+// 19q) 关闭模式后恢复原算法：同输入结果与未启用时字节级一致
+const toggledBack = plan({ ...demo, baseline: null })
+check('关闭重排恢复原算法（字节级）', JSON.stringify(toggledBack) === JSON.stringify(reflowOff))
+
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)
 process.exit(failures === 0 ? 0 : 1)

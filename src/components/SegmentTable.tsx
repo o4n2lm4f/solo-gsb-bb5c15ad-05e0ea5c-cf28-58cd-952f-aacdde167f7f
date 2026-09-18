@@ -6,6 +6,8 @@ interface Props {
   onSelect: (index: number) => void
   /** 基线对比开启时，各需求 ID 对应的变化（仅当前仍有网段的项会显示标记） */
   changesById?: Map<string, ChangeRow>
+  /** 基线优先重排模式开启时，展示各自动网段相对基线原址的结果 */
+  showReflow?: boolean
 }
 
 const KIND_LABEL: Record<Segment['kind'], string> = {
@@ -13,6 +15,16 @@ const KIND_LABEL: Record<Segment['kind'], string> = {
   fixed: '固定',
   auto: '自动',
   free: '空闲',
+}
+
+const REFLOW_LABEL: Record<NonNullable<Segment['baselineOutcome']>, string> = {
+  kept: '保留原址',
+  moved: '迁移',
+}
+
+const REFLOW_CLS: Record<NonNullable<Segment['baselineOutcome']>, string> = {
+  kept: 'reflow-kept',
+  moved: 'reflow-moved',
 }
 
 const CHANGE_LABEL: Partial<Record<ChangeType, string>> = {
@@ -31,7 +43,7 @@ const CHANGE_CLS: Partial<Record<ChangeType, string>> = {
   unchanged: 'unchanged',
 }
 
-export default function SegmentTable({ segments, selectedIndex, onSelect, changesById }: Props) {
+export default function SegmentTable({ segments, selectedIndex, onSelect, changesById, showReflow }: Props) {
   const showBaseline = changesById !== undefined
   return (
     <div className="table-scroll">
@@ -50,6 +62,7 @@ export default function SegmentTable({ segments, selectedIndex, onSelect, change
             <th style={{ textAlign: 'right' }}>需求主机</th>
             <th style={{ textAlign: 'right' }}>浪费</th>
             {showBaseline && <th>基线对比</th>}
+            {showReflow && <th>基线重排</th>}
           </tr>
         </thead>
         <tbody>
@@ -95,6 +108,25 @@ export default function SegmentTable({ segments, selectedIndex, onSelect, change
                             ? '扩容'
                             : '缩容'
                           : CHANGE_LABEL[change.type]}
+                      </span>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
+                )}
+                {showReflow && (
+                  <td>
+                    {seg.kind === 'auto' && seg.baselineOutcome ? (
+                      <span
+                        className={`change-badge ${REFLOW_CLS[seg.baselineOutcome]}`}
+                        title={
+                          seg.baselineAnchored
+                            ? '经包含原网络地址的对齐块优先落位'
+                            : '优先候选不可行，由最低对齐策略落位'
+                        }
+                      >
+                        {REFLOW_LABEL[seg.baselineOutcome]}
+                        {!seg.baselineAnchored ? '（最低对齐）' : ''}
                       </span>
                     ) : (
                       '—'
